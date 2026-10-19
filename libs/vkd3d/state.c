@@ -7539,7 +7539,17 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
         mutable_descriptor_list[set_info->binding_index].descriptorTypeCount =
                 vkd3d_bindless_build_mutable_type_list(mutable_descriptor_types, device->bindless_state.flags, flags);
         mutable_descriptor_list[set_info->binding_index].pDescriptorTypes = mutable_descriptor_types;
+
+        /* A mutable descriptor can only become one of the types in the list. */
+        set_info->vk_descriptor_type_mask = 0;
+        for (i = 0; i < mutable_descriptor_list[set_info->binding_index].descriptorTypeCount; i++)
+            set_info->vk_descriptor_type_mask |= 1u << mutable_descriptor_types[i];
+
+        if (!(set_info->vk_descriptor_type_mask & (1u << vk_init_null_descriptor_type)))
+            set_info->vk_init_null_descriptor_type = mutable_descriptor_types[0];
     }
+    else
+        set_info->vk_descriptor_type_mask = 1u << vk_descriptor_type;
 
     if ((vr = VK_CALL(vkCreateDescriptorSetLayout(device->vk_device,
             &vk_set_layout_info, NULL, &set_info->vk_set_layout))) < 0)

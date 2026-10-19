@@ -1626,6 +1626,10 @@ struct d3d12_null_descriptor_template
         } descriptors;
     } writes;
 
+    /* Copied from the set info of each write. */
+    uint32_t vk_descriptor_type_masks[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
+    VkDescriptorType vk_fallback_null_types[VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS];
+
     unsigned int num_writes;
     unsigned int set_info_mask;
     bool has_mutable_descriptors;
@@ -4525,7 +4529,10 @@ enum vkd3d_bindless_state_info_indices
 struct vkd3d_bindless_set_info
 {
     VkDescriptorType vk_descriptor_type;
+    /* Always a type the binding can hold, also used for null descriptors of types it cannot hold. */
     VkDescriptorType vk_init_null_descriptor_type;
+    /* Bit mask of the VkDescriptorType values the binding can hold. */
+    uint32_t vk_descriptor_type_mask;
     D3D12_DESCRIPTOR_HEAP_TYPE heap_type;
     uint32_t flags; /* vkd3d_bindless_set_flag */
     uint32_t set_index;
