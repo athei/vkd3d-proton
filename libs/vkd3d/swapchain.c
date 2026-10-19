@@ -867,13 +867,16 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwap
 
     chain->desc = *pDesc;
 
-    /* Don't do anything in this case. */
+    /* Don't reallocate anything in this case. ResizeBuffers() still restarts the
+     * back buffer index from 0 when nothing changes. Present requests in flight
+     * carry their own user index, so this does not need a drain. */
     if (old_desc.Width == chain->desc.Width &&
             old_desc.Height == chain->desc.Height &&
             old_desc.BufferCount == chain->desc.BufferCount &&
             old_desc.Format == chain->desc.Format &&
             old_desc.Flags == chain->desc.Flags)
     {
+        chain->user.index = 0;
         return S_OK;
     }
 
@@ -889,12 +892,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwap
         return hr;
     }
 
-    if (chain->user.index >= chain->desc.BufferCount)
-    {
-        /* Need to reset the user index in case the buffer count is lowered.
-         * It is unclear if we're allowed to always reset, but employ principle of least surprise. */
-        chain->user.index = 0;
-    }
+    /* The back buffer index restarts from 0 after ResizeBuffers(). */
+    chain->user.index = 0;
 
 #ifndef _WIN32
     /* Non-Win32 platforms (e.g. Wayland) may not be able to detect resizes on its own.
