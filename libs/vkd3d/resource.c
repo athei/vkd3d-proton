@@ -6327,8 +6327,8 @@ static bool vkd3d_buffer_view_get_aligned_view(
         struct d3d12_device *device, struct d3d12_resource *resource,
         DXGI_FORMAT format, unsigned int vk_flags,
         VkDeviceSize first_element, VkDeviceSize num_elements,
-        VkDeviceSize structured_stride, struct vkd3d_bound_buffer_range *bound_range,
-        struct vkd3d_view **view)
+        VkDeviceSize structured_stride, bool typed_view_is_fallback,
+        struct vkd3d_bound_buffer_range *bound_range, struct vkd3d_view **view)
 {
     const struct vkd3d_format *vkd3d_format;
     VkDeviceSize max_resource_elements;
@@ -6365,7 +6365,25 @@ static bool vkd3d_buffer_view_get_aligned_view(
         /* Requantizing the typed offset is shaky business if we overflow max_elements when doing so.
          * We can always fall back to 0 offset for the difficult and rare cases. */
 
-        if (num_elements > max_elements)
+        if (num_elements > max_elements && typed_view_is_fallback)
+        {
+            /* Shaders read raw and structured views through the storage buffer descriptor.
+             * The typed view is only read by shaders that declare a typed buffer over one,
+             * which is undefined, so clamp it to the limit instead of creating an invalid view.
+             * Align its start to half the limit so that a resource gets few distinct views. */
+            WARN_ONCE("Clamping typed view of raw or structured buffer from %llu to %llu elements.\n",
+                    (unsigned long long)num_elements, (unsigned long long)max_elements);
+
+            element_align = 1u << vkd3d_log2i(max_elements / 2);
+            begin_range = first_element & ~(element_align - 1);
+
+            bound_range->element_offset = first_element - begin_range;
+            bound_range->element_count = max_elements - bound_range->element_offset;
+
+            first_element = begin_range;
+            num_elements = max_elements;
+        }
+        else if (num_elements > max_elements)
         {
             FIXME("Application is attempting to use more elements in a typed buffer (%llu) than supported by device (%llu).\n",
                   (unsigned long long)num_elements, (unsigned long long)max_elements);
@@ -6403,6 +6421,23 @@ static bool vkd3d_buffer_view_get_aligned_view(
         return false;
 
     return true;
+}
+
+static void vkd3d_clamp_raw_buffer_texel_range(struct d3d12_device *device,
+        DXGI_FORMAT texel_format, VkDeviceSize *range)
+{
+    VkDeviceSize max_range;
+
+    /* Clamped for the same reason as typed views of raw buffers in vkd3d_buffer_view_get_aligned_view(). */
+    max_range = (VkDeviceSize)device->device_info.properties2.properties.limits.maxTexelBufferElements *
+            vkd3d_get_format(device, texel_format, false)->byte_count;
+
+    if (*range > max_range)
+    {
+        WARN_ONCE("Clamping texel buffer of raw or structured buffer from %llu to %llu bytes.\n",
+                (unsigned long long)*range, (unsigned long long)max_range);
+        *range = max_range;
+    }
 }
 
 static bool d3d12_resource_desc_supports_heap_raw_ssbo(struct d3d12_device *device,
@@ -6689,6 +6724,7 @@ static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,
     struct vkd3d_view *view = NULL;
     uint32_t vk_write_count = 0;
     struct d3d12_desc_split d;
+    DXGI_FORMAT texel_format;
     unsigned int vk_flags;
     bool is_byte_address;
     uint32_t info_index;
@@ -6868,18 +6904,20 @@ static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,
             addr_info.pNext = NULL;
             addr_info.address = d.view->info.buffer.va;
             addr_info.range = d.view->info.buffer.range;
-            addr_info.format = vkd3d_internal_get_vk_format(device, d.view->info.buffer.dxgi_format);
+            texel_format = d.view->info.buffer.dxgi_format;
+            addr_info.format = vkd3d_internal_get_vk_format(device, texel_format);
             /* If we really intended to emit raw buffers, the fallback will be inferred as R32_UINT. */
             if (addr_info.format == VK_FORMAT_UNDEFINED)
             {
                 if (is_byte_address)
                 {
+                    texel_format = DXGI_FORMAT_R32_UINT;
                     addr_info.format = VK_FORMAT_R32_UINT;
                 }
                 else
                 {
-                    addr_info.format = vkd3d_internal_get_vk_format(device,
-                            vkd3d_structured_srv_to_texel_buffer_dxgi_format(stride));
+                    texel_format = vkd3d_structured_srv_to_texel_buffer_dxgi_format(stride);
+                    addr_info.format = vkd3d_internal_get_vk_format(device, texel_format);
 
                     if (!addr_info.format)
                     {
@@ -6888,6 +6926,8 @@ static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,
                     }
                 }
             }
+            if (addr_info.format && desc_is_raw && emit_ssbo)
+                vkd3d_clamp_raw_buffer_texel_range(device, texel_format, &addr_info.range);
             payload = d3d12_descriptor_heap_get_mapped_payload(d.heap, binding.set, d.offset);
             VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
                     device->device_info.descriptor_buffer_properties.robustUniformTexelBufferDescriptorSize,
@@ -6901,7 +6941,7 @@ static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,
             vk_flags = vkd3d_view_flags_from_d3d12_buffer_srv_flags(desc->Buffer.Flags);
             if (!vkd3d_buffer_view_get_aligned_view(device, resource, desc->Format, vk_flags,
                     desc->Buffer.FirstElement, desc->Buffer.NumElements, desc->Buffer.StructureByteStride,
-                    &bound_range, &view))
+                    desc_is_raw && emit_ssbo, &bound_range, &view))
                 return;
 
             descriptor_info[vk_write_count].buffer_view = view ? view->vk_buffer_view : VK_NULL_HANDLE;
@@ -7798,6 +7838,7 @@ static void vkd3d_create_buffer_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3
     VkDescriptorGetInfoEXT get_info;
     struct vkd3d_view *view = NULL;
     struct d3d12_desc_split d;
+    DXGI_FORMAT texel_format;
     uint32_t descriptor_index;
     uint32_t counter_offset;
     bool is_byte_address;
@@ -7949,19 +7990,21 @@ static void vkd3d_create_buffer_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3
             addr_info.pNext = NULL;
             addr_info.address = d.view->info.buffer.va;
             addr_info.range = d.view->info.buffer.range;
-            addr_info.format = vkd3d_internal_get_vk_format(device, d.view->info.buffer.dxgi_format);
+            texel_format = d.view->info.buffer.dxgi_format;
+            addr_info.format = vkd3d_internal_get_vk_format(device, texel_format);
 
             if (addr_info.format == VK_FORMAT_UNDEFINED)
             {
                 /* If we really intended to emit raw buffers, the fallback will be inferred as R32_UINT. */
                 if (is_byte_address)
                 {
+                    texel_format = DXGI_FORMAT_R32_UINT;
                     addr_info.format = VK_FORMAT_R32_UINT;
                 }
                 else
                 {
-                    addr_info.format = vkd3d_internal_get_vk_format(device,
-                            vkd3d_structured_uav_to_texel_buffer_dxgi_format(stride));
+                    texel_format = vkd3d_structured_uav_to_texel_buffer_dxgi_format(stride);
+                    addr_info.format = vkd3d_internal_get_vk_format(device, texel_format);
 
                     if (!addr_info.format)
                     {
@@ -7970,6 +8013,9 @@ static void vkd3d_create_buffer_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3
                     }
                 }
             }
+
+            if (addr_info.format && desc_is_raw && emit_ssbo)
+                vkd3d_clamp_raw_buffer_texel_range(device, texel_format, &addr_info.range);
 
             payload = d3d12_descriptor_heap_get_mapped_payload(d.heap, binding.set, d.offset);
             VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
@@ -7984,7 +8030,7 @@ static void vkd3d_create_buffer_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3
 
             if (!vkd3d_buffer_view_get_aligned_view(device, resource, desc->Format, flags,
                     desc->Buffer.FirstElement, desc->Buffer.NumElements,
-                    desc->Buffer.StructureByteStride, &bound_range, &view))
+                    desc->Buffer.StructureByteStride, desc_is_raw && emit_ssbo, &bound_range, &view))
                 return;
 
             descriptor_info[vk_write_count].buffer_view = view ? view->vk_buffer_view : VK_NULL_HANDLE;
