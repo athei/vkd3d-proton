@@ -135,6 +135,9 @@ struct present_wait_entry
     uint64_t id;
     uint64_t present_count;
     uint64_t begin_frame_time_ns;
+    /* Nonzero if nothing was presented, e.g. for a minimized window:
+     * the time the present would have taken on screen. */
+    uint64_t blank_interval_ns;
     bool present_timing_enabled;
 };
 
@@ -264,8 +267,6 @@ struct dxgi_vk_swap_chain
 
         struct vkd3d_swapchain_info pipeline;
 
-        uint32_t is_occlusion_state; /* Updated atomically. */
-
         /* State tracking in present tasks on how to deal with swapchain recreation. */
         bool force_swapchain_recreation;
         bool is_surface_lost;
@@ -349,6 +350,7 @@ struct dxgi_vk_swap_chain
         pthread_cond_t cond;
         pthread_mutex_t lock;
         bool skip_waits;
+        bool skip_blank_pacing;
 
         struct
         {
@@ -361,6 +363,9 @@ struct dxgi_vk_swap_chain
          * accessed by wait thread. */
         uint64_t timing_domain_counter;
         uint64_t timing_property_counter;
+
+        /* When the last blank present is considered complete. Only accessed by wait thread. */
+        uint64_t blank_deadline_ns;
     } wait_thread;
 };
 
@@ -510,7 +515,8 @@ static void dxgi_vk_swap_chain_drain_queue(struct dxgi_vk_swap_chain *chain)
 }
 
 static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
-        uint64_t present_count, uint64_t present_id, uint64_t begin_frame_time_ns, bool present_timing_enabled)
+        uint64_t present_count, uint64_t present_id, uint64_t begin_frame_time_ns,
+        uint64_t blank_interval_ns, bool present_timing_enabled)
 {
     struct present_wait_entry *entry;
     pthread_mutex_lock(&chain->wait_thread.lock);
@@ -520,6 +526,7 @@ static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
     entry->id = present_id;
     entry->present_count = present_count;
     entry->begin_frame_time_ns = begin_frame_time_ns;
+    entry->blank_interval_ns = blank_interval_ns;
     entry->present_timing_enabled = present_timing_enabled;
     pthread_cond_signal(&chain->wait_thread.cond);
     pthread_mutex_unlock(&chain->wait_thread.lock);
@@ -543,7 +550,13 @@ static void dxgi_vk_swap_chain_cleanup_low_latency(struct dxgi_vk_swap_chain *ch
 
 static void dxgi_vk_swap_chain_cleanup_waiter_thread(struct dxgi_vk_swap_chain *chain)
 {
-    dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0, true);
+    /* Don't pace blank presents still queued one by one. Real presents are
+     * still waited for, they must complete before the swapchain is destroyed. */
+    pthread_mutex_lock(&chain->wait_thread.lock);
+    chain->wait_thread.skip_blank_pacing = true;
+    pthread_mutex_unlock(&chain->wait_thread.lock);
+
+    dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0, 0, true);
     pthread_join(chain->wait_thread.thread, NULL);
     pthread_mutex_destroy(&chain->wait_thread.lock);
     pthread_cond_destroy(&chain->wait_thread.cond);
@@ -1002,48 +1015,6 @@ static void dxgi_vk_swap_chain_set_hdr_metadata(struct dxgi_vk_swap_chain *chain
     VK_CALL(vkSetHdrMetadataEXT(chain->queue->device->vk_device, 1, &chain->present.vk_swapchain, &hdr_metadata));
 }
 
-#ifdef _WIN32
-static bool dxgi_vk_swap_chain_present_task_is_idle(struct dxgi_vk_swap_chain *chain)
-{
-    uint64_t presented_count = vkd3d_atomic_uint64_load_explicit(&chain->present.present_count, vkd3d_memory_order_acquire);
-    return presented_count == chain->user.present_count;
-}
-
-static bool dxgi_vk_swap_chain_is_occluded(struct dxgi_vk_swap_chain *chain)
-{
-    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
-    VkPhysicalDevice vk_physical_device = chain->queue->device->vk_physical_device;
-    VkSurfaceCapabilitiesKHR surface_caps;
-
-    VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, chain->vk_surface, &surface_caps));
-    /* Win32 jank, when these are 0 we cannot create a swapchain. */
-    return surface_caps.maxImageExtent.width == 0 || surface_caps.maxImageExtent.height == 0;
-}
-#endif
-
-static bool dxgi_vk_swap_chain_present_is_occluded(struct dxgi_vk_swap_chain *chain)
-{
-#ifdef _WIN32
-    if (dxgi_vk_swap_chain_present_task_is_idle(chain))
-    {
-        /* Query the surface directly. */
-        chain->present.is_occlusion_state = dxgi_vk_swap_chain_is_occluded(chain);
-        return chain->present.is_occlusion_state != 0;
-    }
-    else
-    {
-        /* If presentation requests are pending it is not safe to access the surface directly
-         * without adding tons of locks everywhere,
-         * so rely on observed behavior from presentation thread. */
-        return vkd3d_atomic_uint32_load_explicit(&chain->present.is_occlusion_state, vkd3d_memory_order_relaxed) != 0;
-    }
-#else
-	/* Irrelevant on native build. */
-	(void)chain;
-	return false;
-#endif
-}
-
 static void dxgi_vk_swap_chain_present_callback(void *chain);
 
 static void dxgi_vk_swap_chain_wait_internal_handle(struct dxgi_vk_swap_chain *chain, bool low_latency_enable)
@@ -1125,8 +1096,9 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
             iface, SyncInterval, PresentFlags, pPresentParameters);
     (void)pPresentParameters;
 
-    if (dxgi_vk_swap_chain_present_is_occluded(chain))
-        return DXGI_STATUS_OCCLUDED;
+    /* A D3D12 swap chain is not occluded when its window is minimized. Such a
+     * present is queued like any other and paced as if it had been displayed,
+     * so there is nothing for a test present to report. */
     if (PresentFlags & DXGI_PRESENT_TEST)
         return S_OK;
 
@@ -2079,7 +2051,6 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     VkSurfaceFormatKHR surface_format;
     VkImageViewCreateInfo view_info;
     uint32_t override_image_count;
-    bool new_occlusion_state;
     char count_env[16];
     VkResult vr;
     uint32_t i;
@@ -2088,6 +2059,25 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
 
     /* Don't bother if we've observed ERROR_SURFACE_LOST. */
     if (chain->present.is_surface_lost)
+        return;
+
+    /* We get here on every present while the window is minimized, so check
+     * the surface first and keep the rest for when we can create a swapchain. */
+    vr = VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, chain->vk_surface, &surface_caps));
+    if (vr == VK_ERROR_SURFACE_LOST_KHR)
+    {
+        chain->present.is_surface_lost = true;
+        return;
+    }
+    else if (vr < 0)
+    {
+        WARN_ONCE("Failed to query surface capabilities, vr %d.\n", vr);
+        return;
+    }
+
+    /* Win32 quirk. Minimized windows have maximum extents of zero.
+     * There is nothing to do. We'll do a dummy present, which the wait thread paces. */
+    if (surface_caps.maxImageExtent.width == 0 || surface_caps.maxImageExtent.height == 0)
         return;
 
     /* Hard evidence that we're going ahead with swapchain creation, demote any existing LL2 chain
@@ -2106,16 +2096,7 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     }
     pthread_mutex_unlock(&chain->properties.lock);
 
-    VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, chain->vk_surface, &surface_caps));
     dxgi_vk_swap_chain_update_wait_timing_capabilities(chain);
-
-    /* Win32 quirk. Minimized windows have maximum extents of zero. */
-    new_occlusion_state = surface_caps.maxImageExtent.width == 0 || surface_caps.maxImageExtent.height == 0;
-    vkd3d_atomic_uint32_store_explicit(&chain->present.is_occlusion_state, (uint32_t)new_occlusion_state, vkd3d_memory_order_relaxed);
-
-    /* There is nothing to do. We'll do a dummy present. */
-    if (new_occlusion_state)
-        return;
 
     /* Sanity check, this cannot happen on Win32 surfaces, but could happen on Wayland. */
     if (surface_caps.currentExtent.width == UINT32_MAX || surface_caps.currentExtent.height == UINT32_MAX)
@@ -3134,12 +3115,28 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
     }
 }
 
+static uint64_t dxgi_vk_swap_chain_get_blank_interval(struct dxgi_vk_swap_chain *chain)
+{
+    /* Without a swapchain there is no present timing to ask,
+     * so fall back to 60 Hz when the refresh duration is unknown. */
+    uint64_t refresh_duration_ns = chain->timing.refresh_duration ? chain->timing.refresh_duration : 1000000000ull / 60;
+
+    return refresh_duration_ns * max(chain->request.swap_interval, 1u);
+}
+
 static void dxgi_vk_swap_chain_signal_waitable_handle(struct dxgi_vk_swap_chain *chain, uint64_t present_count)
 {
     uint64_t present_id = chain->present.present_id_valid ? chain->present.present_id : 0;
+    uint64_t blank_interval_ns = 0;
+
+    /* Nothing reached the screen, e.g. because the window is minimized. The application
+     * still gets S_OK, so pace it as if the present had been displayed.
+     * Otherwise it would render as fast as it can. */
+    if (!chain->present.vk_swapchain)
+        blank_interval_ns = dxgi_vk_swap_chain_get_blank_interval(chain);
 
     dxgi_vk_swap_chain_push_present_id(chain, present_count, present_id, chain->request.begin_frame_time_ns,
-            chain->present.present_target_enabled);
+            blank_interval_ns, chain->present.present_target_enabled);
 }
 
 static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain, uint64_t current_time_ns);
@@ -3584,6 +3581,26 @@ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain
     }
 }
 
+static void dxgi_vk_swap_chain_pace_blank_present(struct dxgi_vk_swap_chain *chain, uint64_t interval_ns)
+{
+    uint64_t current_time_ns, deadline_ns;
+
+    /* Honor a lower frame rate limit as delay_next_frame() would. */
+    pthread_mutex_lock(&chain->frame_rate_limit.lock);
+    if (chain->frame_rate_limit.enable)
+        interval_ns = max(interval_ns, chain->frame_rate_limit.target_interval_ns);
+    pthread_mutex_unlock(&chain->frame_rate_limit.lock);
+
+    /* Keep a steady cadence while blank presents keep coming in time.
+     * A late one, e.g. the first after the window was minimized, does not wait. */
+    current_time_ns = vkd3d_get_current_time_ns();
+    deadline_ns = max(chain->wait_thread.blank_deadline_ns + interval_ns, current_time_ns);
+    chain->wait_thread.blank_deadline_ns = deadline_ns;
+
+    if (current_time_ns < deadline_ns)
+        dxgi_vk_swap_chain_platform_sleep_for_ns(&chain->frame_rate_limit.sleep_state, deadline_ns - current_time_ns);
+}
+
 static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
 {
     struct dxgi_vk_swap_chain *chain = chain_;
@@ -3637,11 +3654,16 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
         else
         {
             dxgi_vk_swap_chain_drain_complete_semaphore(chain, entry.present_count);
+
+            /* Stands in for the wait for the present. */
+            if (entry.blank_interval_ns && !chain->wait_thread.skip_waits &&
+                    !chain->wait_thread.skip_blank_pacing)
+                dxgi_vk_swap_chain_pace_blank_present(chain, entry.blank_interval_ns);
         }
 
         end_frame_time_ns = vkd3d_get_current_time_ns();
 
-        if (chain->present.wait && !entry.present_timing_enabled)
+        if (chain->present.wait && !entry.present_timing_enabled && !entry.blank_interval_ns)
             dxgi_vk_swap_chain_delay_next_frame(chain, end_frame_time_ns);
 
         /* If we're rendering with IMMEDIATE, we ignore present timing. */
