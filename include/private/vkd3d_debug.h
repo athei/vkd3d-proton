@@ -119,6 +119,7 @@ const char *debugstr_w(const WCHAR *wstr);
 #endif
 
 #define FIXME_ONCE VKD3D_DBG_LOG_ONCE(FIXME, TRACE)
+#define WARN_ONCE VKD3D_DBG_LOG_ONCE(WARN, TRACE)
 
 static inline const char *debugstr_guid(const GUID *guid)
 {
