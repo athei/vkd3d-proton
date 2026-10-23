@@ -1861,8 +1861,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
 
     info->supports_opacity_micromap = info->opacity_micromap_features.micromap;
 
-    /* if nonzero, this is a layered implementation */
-    if (real_driver_props.driverID)
+    /* if nonzero, this is a layered implementation. Only a layer on Vulkan fills in the
+     * driver properties of the API below; an implementation layered on another API, as
+     * KosmicKrisp is on Metal, leaves them alone, and through Wine's thunks they may then
+     * hold any value. */
+    if (real_driver_props.driverID && layered_props_list.layeredApiCount &&
+            layered_props.layeredAPI == VK_PHYSICAL_DEVICE_LAYERED_API_VULKAN_KHR)
     {
         /* store the layer ID here in case it's needed */
         info->layer_driver_id = info->vulkan_1_2_properties.driverID;
