@@ -1017,6 +1017,13 @@ static void dxgi_vk_swap_chain_set_hdr_metadata(struct dxgi_vk_swap_chain *chain
 
 static void dxgi_vk_swap_chain_present_callback(void *chain);
 
+/* How long one Present may block on the internal frame latency handle. While frames are
+ * being displayed, Present waits about one frame here, which even at sync interval 4 on a
+ * 24 Hz display is under 200 ms. The deadline has to stay well above that: each time it
+ * expires, the application may queue one frame more than the latency allows, so one whose
+ * frames all took longer than the deadline would queue frames without limit. */
+#define DXGI_VK_SWAP_CHAIN_INTERNAL_LATENCY_TIMEOUT_NS 1000000000ull
+
 static void dxgi_vk_swap_chain_wait_internal_handle(struct dxgi_vk_swap_chain *chain, bool low_latency_enable)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
@@ -1077,10 +1084,43 @@ static void dxgi_vk_swap_chain_wait_internal_handle(struct dxgi_vk_swap_chain *c
     }
     else
     {
+        /* The internal handle is released once a present has been displayed, which can only
+         * happen after every command the application queued before it. If the application
+         * made the queue wait on a fence that it signals from the CPU only after more
+         * presents, nothing is released until then and an unbounded wait here deadlocks.
+         * Give each Present one deadline instead. When it expires, the counts we could not
+         * acquire carry over to the next Present, as in the non-blocking path above.
+         *
+         * Each carried count lets one more present than the internal latency be in flight.
+         * With more than DXGI_MAX_SWAP_CHAIN_BUFFERS in flight, Present would overwrite
+         * entries of request_ring that the present callback has not read yet, and the
+         * releases of the internal handle would exceed the maximum count of its semaphore.
+         * So carry only up to that bound, and beyond it wait without a deadline. */
+        const uint32_t max_carried_counts = DXGI_MAX_SWAP_CHAIN_BUFFERS - chain->frame_latency_internal;
+        uint64_t deadline_ns = vkd3d_get_current_time_ns() + DXGI_VK_SWAP_CHAIN_INTERNAL_LATENCY_TIMEOUT_NS;
+        uint64_t current_time_ns;
+
         while (chain->frame_latency_event_internal_wait_counts)
         {
-            vkd3d_native_sync_handle_acquire(chain->frame_latency_event_internal);
-            chain->frame_latency_event_internal_wait_counts--;
+            current_time_ns = vkd3d_get_current_time_ns();
+            if (current_time_ns >= deadline_ns)
+            {
+                if (chain->frame_latency_event_internal_wait_counts <= max_carried_counts)
+                {
+                    WARN_ONCE("Frame latency wait timed out, carrying %u counts to the next Present.\n",
+                            chain->frame_latency_event_internal_wait_counts);
+                    break;
+                }
+
+                if (vkd3d_native_sync_handle_acquire(chain->frame_latency_event_internal))
+                    chain->frame_latency_event_internal_wait_counts--;
+                continue;
+            }
+
+            /* Round up so that we never spin on a timeout of 0. */
+            if (vkd3d_native_sync_handle_acquire_timeout(chain->frame_latency_event_internal,
+                    (deadline_ns - current_time_ns + 999999) / 1000000))
+                chain->frame_latency_event_internal_wait_counts--;
         }
     }
 }
