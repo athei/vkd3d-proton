@@ -367,6 +367,18 @@ struct dxgi_vk_swap_chain
         /* When the last blank present is considered complete. Only accessed by wait thread. */
         uint64_t blank_deadline_ns;
     } wait_thread;
+
+    /* Releases frame_latency_event once the GPU has completed a present.
+     * Only started for swap chains with a frame latency waitable object. */
+    struct
+    {
+        pthread_t thread;
+        pthread_cond_t cond;
+        pthread_mutex_t lock;
+        uint64_t present_count; /* The last present queued for a release. */
+        bool stop;
+        bool active; /* Set before the wait thread starts, read-only afterwards. */
+    } latency_thread;
 };
 
 static void dxgi_vk_swap_chain_drain_internal_blit_semaphore(struct dxgi_vk_swap_chain *chain, uint64_t value);
@@ -532,6 +544,112 @@ static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
     pthread_mutex_unlock(&chain->wait_thread.lock);
 }
 
+static void dxgi_vk_swap_chain_release_frame_latency_event(struct dxgi_vk_swap_chain *chain)
+{
+    int previous_semaphore;
+
+    if ((previous_semaphore = vkd3d_native_sync_handle_release(chain->frame_latency_event, 1)) >= 0)
+    {
+        /* Some applications can keep using MaxLatency of 1,
+         * but just avoid acquiring the semaphore a few times to achieve higher latency.
+         * Only warn if the counter becomes unreasonably large, e.g. 4+ frames.
+         * That's a good sign the application is actually not behaving correctly. */
+        if (previous_semaphore >= (int)chain->frame_latency + 4)
+        {
+            TRACE("Incrementing frame latency semaphore beyond max latency. "
+                    "Did application forget to acquire? (new count = %d, max latency = %u)\n",
+                    previous_semaphore + 1, chain->frame_latency);
+        }
+    }
+    else
+        TRACE("Failed to increment swapchain semaphore. Did application forget to acquire?\n");
+}
+
+static void dxgi_vk_swap_chain_push_latency_present(struct dxgi_vk_swap_chain *chain, uint64_t present_count)
+{
+    pthread_mutex_lock(&chain->latency_thread.lock);
+    chain->latency_thread.present_count = present_count;
+    pthread_cond_signal(&chain->latency_thread.cond);
+    pthread_mutex_unlock(&chain->latency_thread.lock);
+}
+
+static void *dxgi_vk_swap_chain_latency_worker(void *chain_)
+{
+    struct dxgi_vk_swap_chain *chain = chain_;
+    uint64_t released_count = 0;
+    uint64_t present_count;
+
+    vkd3d_set_thread_name("vkd3d-swapchain-latency");
+
+    for (;;)
+    {
+        pthread_mutex_lock(&chain->latency_thread.lock);
+        while (chain->latency_thread.present_count == released_count && !chain->latency_thread.stop)
+            pthread_cond_wait(&chain->latency_thread.cond, &chain->latency_thread.lock);
+        present_count = chain->latency_thread.present_count;
+        pthread_mutex_unlock(&chain->latency_thread.lock);
+
+        /* Every queued present is released before we stop. */
+        if (present_count == released_count)
+            break;
+
+        /* Present counts are queued in order, and the complete semaphore reaches each
+         * of them once the GPU has finished the blit of that present. */
+        while (released_count < present_count)
+        {
+            dxgi_vk_swap_chain_drain_complete_semaphore(chain, ++released_count);
+            dxgi_vk_swap_chain_release_frame_latency_event(chain);
+        }
+    }
+
+    return NULL;
+}
+
+static void dxgi_vk_swap_chain_init_latency_thread(struct dxgi_vk_swap_chain *chain)
+{
+    /* Without this thread, the wait thread releases the frame latency handle once a
+     * present has been displayed. On Metal through KosmicKrisp, a present to a window
+     * is displayed one to two refresh cycles after the GPU has finished it, and our
+     * present thread adds about one more. An application at the default maximum frame
+     * latency of 1 then starts a frame only every few refresh cycles, however little
+     * work a frame is, and the GPU idles and clocks down in between. Release the handle
+     * once the GPU has completed the present instead, close to when Windows signals it
+     * at the flip. The internal frame latency handle still waits for the display, so
+     * how far an application gets ahead of the display stays bounded. */
+    if (!vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
+        return;
+
+    pthread_mutex_init(&chain->latency_thread.lock, NULL);
+    pthread_cond_init(&chain->latency_thread.cond, NULL);
+
+    if (pthread_create(&chain->latency_thread.thread, NULL, dxgi_vk_swap_chain_latency_worker, chain))
+    {
+        WARN("Failed to create frame latency thread, releasing the frame latency handle after the present wait.\n");
+        pthread_mutex_destroy(&chain->latency_thread.lock);
+        pthread_cond_destroy(&chain->latency_thread.cond);
+        return;
+    }
+
+    chain->latency_thread.active = true;
+    INFO("Releasing the frame latency handle when the GPU has completed a present.\n");
+}
+
+static void dxgi_vk_swap_chain_cleanup_latency_thread(struct dxgi_vk_swap_chain *chain)
+{
+    if (!chain->latency_thread.active)
+        return;
+
+    pthread_mutex_lock(&chain->latency_thread.lock);
+    chain->latency_thread.stop = true;
+    pthread_cond_signal(&chain->latency_thread.cond);
+    pthread_mutex_unlock(&chain->latency_thread.lock);
+
+    pthread_join(chain->latency_thread.thread, NULL);
+    pthread_mutex_destroy(&chain->latency_thread.lock);
+    pthread_cond_destroy(&chain->latency_thread.cond);
+    chain->latency_thread.active = false;
+}
+
 static void dxgi_vk_swap_chain_cleanup_frame_rate_limiter(struct dxgi_vk_swap_chain *chain)
 {
     pthread_mutex_destroy(&chain->frame_rate_limit.lock);
@@ -561,6 +679,8 @@ static void dxgi_vk_swap_chain_cleanup_waiter_thread(struct dxgi_vk_swap_chain *
     pthread_mutex_destroy(&chain->wait_thread.lock);
     pthread_cond_destroy(&chain->wait_thread.cond);
     vkd3d_free(chain->wait_thread.wait_queue);
+
+    dxgi_vk_swap_chain_cleanup_latency_thread(chain);
 }
 
 static void dxgi_vk_swap_chain_cleanup_surface(struct dxgi_vk_swap_chain *chain)
@@ -3177,6 +3297,9 @@ static void dxgi_vk_swap_chain_signal_waitable_handle(struct dxgi_vk_swap_chain 
 
     dxgi_vk_swap_chain_push_present_id(chain, present_count, present_id, chain->request.begin_frame_time_ns,
             blank_interval_ns, chain->present.present_target_enabled);
+
+    if (chain->latency_thread.active)
+        dxgi_vk_swap_chain_push_latency_present(chain, present_count);
 }
 
 static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain, uint64_t current_time_ns);
@@ -3650,7 +3773,6 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
     struct vkd3d_queue_timeline_trace_cookie cookie;
     struct present_wait_entry entry;
     uint64_t end_frame_time_ns = 0;
-    int previous_semaphore;
 
     vkd3d_set_thread_name("vkd3d-swapchain-sync");
 
@@ -3723,24 +3845,11 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
 
         dxgi_vk_swap_chain_update_frame_statistics(chain, entry.present_count, entry.id);
 
-        if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
-        {
-            if ((previous_semaphore = vkd3d_native_sync_handle_release(chain->frame_latency_event, 1)) >= 0)
-            {
-                /* Some applications can keep using MaxLatency of 1,
-                 * but just avoid acquiring the semaphore a few times to achieve higher latency.
-                 * Only warn if the counter becomes unreasonably large, e.g. 4+ frames.
-                 * That's a good sign the application is actually not behaving correctly. */
-                if (previous_semaphore >= (int)chain->frame_latency + 4)
-                {
-                    TRACE("Incrementing frame latency semaphore beyond max latency. "
-                            "Did application forget to acquire? (new count = %d, max latency = %u)\n",
-                            previous_semaphore + 1, chain->frame_latency);
-                }
-            }
-            else
-                TRACE("Failed to increment swapchain semaphore. Did application forget to acquire?\n");
-        }
+        /* Unless the frame latency thread releases it when the GPU has completed the present.
+         * Then the application can wake from the handle before the frame statistics above
+         * count that present, and GetFrameStatistics right after the wait may lag by one. */
+        if (!chain->latency_thread.active && vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
+            dxgi_vk_swap_chain_release_frame_latency_event(chain);
 
         if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event_internal))
             vkd3d_native_sync_handle_release(chain->frame_latency_event_internal, 1);
@@ -3773,12 +3882,18 @@ static HRESULT dxgi_vk_swap_chain_init_waiter_thread(struct dxgi_vk_swap_chain *
     pthread_mutex_init(&chain->wait_thread.lock, NULL);
     pthread_cond_init(&chain->wait_thread.cond, NULL);
 
+    /* Before the wait thread starts, which checks whether it is active. */
+    dxgi_vk_swap_chain_init_latency_thread(chain);
+
     /* Have to throw a thread under the bus unfortunately.
      * That thread will only wait on present IDs and release HANDLEs as necessary. */
     if (pthread_create(&chain->wait_thread.thread, NULL, dxgi_vk_swap_chain_wait_worker, chain))
     {
+        dxgi_vk_swap_chain_cleanup_latency_thread(chain);
         pthread_mutex_destroy(&chain->wait_thread.lock);
         pthread_cond_destroy(&chain->wait_thread.cond);
+        vkd3d_free(chain->wait_thread.wait_queue);
+        chain->wait_thread.wait_queue = NULL;
         return E_OUTOFMEMORY;
     }
 
