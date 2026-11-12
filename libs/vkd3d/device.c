@@ -6756,6 +6756,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
             return S_OK;
         }
 
+        if (!device->vk_info.KHR_external_memory_win32)
+        {
+            WARN("VK_KHR_external_memory_win32 is not supported, cannot share resource.\n");
+            ID3D12Resource_Release(resource_iface);
+            return E_NOTIMPL;
+        }
+
         if (attributes)
             FIXME("attributes %p not handled.\n", attributes);
         if (access)
@@ -6825,6 +6832,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
         {
             ID3D12Fence_Release(fence_iface);
             return S_OK;
+        }
+
+        if (!device->vk_info.KHR_external_semaphore_win32)
+        {
+            WARN("VK_KHR_external_semaphore_win32 is not supported, cannot share fence.\n");
+            ID3D12Fence_Release(fence_iface);
+            return E_NOTIMPL;
         }
 
         if (attributes)

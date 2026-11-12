@@ -61,6 +61,12 @@ void d3d12_shared_fence_open_export_kmt(struct d3d12_shared_fence *fence, struct
         return;
     }
 
+    if (!device->vk_info.KHR_external_semaphore_win32)
+    {
+        WARN("VK_KHR_external_semaphore_win32 is not supported, cannot export shared fence.\n");
+        return;
+    }
+
     win32_handle_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
     win32_handle_info.pNext = NULL;
     win32_handle_info.semaphore = fence->timeline_semaphore;
@@ -99,6 +105,12 @@ void d3d12_resource_open_export_kmt(struct d3d12_resource *resource, struct d3d1
     if (!device->kmt_local)
     {
         /* D3DKMT API isn't supported */
+        return;
+    }
+
+    if (!device->vk_info.KHR_external_memory_win32)
+    {
+        WARN("VK_KHR_external_memory_win32 is not supported, cannot export shared resource.\n");
         return;
     }
 

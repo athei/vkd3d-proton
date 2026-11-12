@@ -4475,6 +4475,10 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
                 import_info.name = NULL;
                 allocate_info.pNext = &import_info;
             }
+            else if (!device->vk_info.KHR_external_memory_win32)
+            {
+                WARN("VK_KHR_external_memory_win32 is not supported, shared resource cannot be exported.\n");
+            }
             else
             {
                 export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
